@@ -66,7 +66,7 @@ def rocm_aiter_rms_norm_impl(
     if x.dim() > 2:
         x_original_shape = x.shape
         x = x.reshape(-1, x_original_shape[-1])
-        x = rocm_aiter.rms_norm(x, weight, variance_epsilon)
+        x = rocm_aiter.ops.triton.rmsnorm.rms_norm(x, weight, variance_epsilon)
         return x.reshape(x_original_shape)
 
     return rocm_aiter.rms_norm(x, weight, variance_epsilon)
@@ -82,7 +82,7 @@ def rocm_aiter_rmsnorm2d_fwd_with_add_impl(
 
     residual_out = torch.empty_like(residual)
     output = torch.empty_like(x)
-    rocm_aiter.rmsnorm2d_fwd_with_add(
+    rocm_aiter.ops.triton.rmsnorm.rmsnorm2d_fwd_with_add(
         output,  # output
         x,  # input
         residual,  # residual input
