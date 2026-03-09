@@ -36,6 +36,63 @@ logger = init_logger(__name__)
 
 
 @triton.jit
+def generate_sparse_seqlen_kernel(
+    seq_len_ptr,  # [num_seq]
+    cu_query_lens_ptr,  # [num_seq]
+    out_ptr,  # [num_query_tokens]
+    topk_token: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    seq_id = tl.program_id(0)
+    query_offset = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    query_start = tl.load(cu_query_lens_ptr + seq_id)
+    query_end = tl.load(cu_query_lens_ptr + seq_id + 1)
+    if query_start + tl.program_id(1) * BLOCK_SIZE > query_end:
+        return
+    query_len = query_end - query_start
+    query_mask = query_offset + query_start < query_end
+    seq_len = tl.load(seq_len_ptr + seq_id)
+    if seq_len == 0:
+        return
+    context_start_point = seq_len - query_len
+    sparse_seqlen = context_start_point + query_offset
+    sparse_seqlen_masked = tl.where(
+        sparse_seqlen + 1 < topk_token, sparse_seqlen + 1, topk_token
+    )
+    tl.store(
+        out_ptr + query_start + query_offset,
+        sparse_seqlen_masked,
+        mask=query_mask,
+    )
+
+
+def generate_sparse_seqlen_triton(
+    query_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    cu_query_lens: torch.Tensor,
+    topk_token: int,
+    num_tokens: int,
+    max_query_len: int,
+):
+    num_seqs = query_lens.size(0)
+    out = torch.zeros([num_tokens], dtype=torch.int32, device=query_lens.device)
+    block_size = 64
+    num_block_per_row = triton.cdiv(max_query_len, block_size)
+    grid = (
+        num_seqs,
+        num_block_per_row,
+    )
+    generate_sparse_seqlen_kernel[grid](
+        seq_lens,
+        cu_query_lens,
+        out,
+        topk_token,
+        block_size,
+    )
+    return out
+
+
+@triton.jit
 def fetch_id_to_ragged_kernel(
     in_tensor_ptr,  # [num_seq, topk]
     cumsum_ptr,  # [num_seq + 1]
@@ -83,11 +140,12 @@ class ROCMAiterMLASparseBackend(AttentionBackend):
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "bfloat16",
+        "fp8_e4m3",
     ]
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [1]
+        return [64]
 
     @staticmethod
     def get_name() -> str:
@@ -143,7 +201,7 @@ class ROCMAiterMLASparseMetadata(AttentionMetadata):
     paged_kv_indptr: torch.Tensor
     paged_kv_indptr_rest: torch.Tensor
 
-    block_size: int = 1
+    block_size: int = 64
     topk_tokens: int = 2048
 
 
@@ -151,7 +209,9 @@ class ROCMAiterMLASparseMetadata(AttentionMetadata):
 class ROCMAiterMLASparseMetadataBuilder(
     AttentionMetadataBuilder[ROCMAiterMLASparseMetadata]
 ):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
+        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    )
 
     def __init__(
         self,
@@ -222,6 +282,26 @@ class ROCMAiterMLASparseMetadataBuilder(
         )
         self.paged_kv_indices.fill_(0)
         self.paged_kv_indptr.fill_(0)
+
+        query_lens = (
+            common_attn_metadata.query_start_loc[1:]
+            - common_attn_metadata.query_start_loc[:-1]
+        )
+        sparse_seqlen = generate_sparse_seqlen_triton(
+            query_lens,
+            common_attn_metadata.seq_lens,
+            common_attn_metadata.query_start_loc,
+            self.topk_tokens,
+            num_tokens,
+            common_attn_metadata.max_query_len,
+        )
+        torch.cumsum(
+            sparse_seqlen, dim=0,
+            out=self.paged_kv_indptr[1:num_tokens + 1],
+        )
+        self.paged_kv_indptr[num_tokens + 1:].fill_(
+            self.paged_kv_indptr[num_tokens]
+        )
 
         req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
         qo_indptr = self.qo_indptr[: num_tokens + 1]
@@ -306,6 +386,7 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
         self.softmax_scale = scale
         assert indexer is not None
         self.topk_indices_buffer: torch.Tensor | None = indexer.topk_indices_buffer
+        self.supports_quant_query_input = True
 
     def _forward_bf16_kv(
         self,
@@ -313,6 +394,7 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
         kv_c_and_k_pe_cache: torch.Tensor,  # [blocks, heads, d_qk]
         topk_indices: torch.Tensor,  # [sq, topk]
         attn_metadata: ROCMAiterMLASparseMetadata,
+        layer: AttentionLayer,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
         output = torch.empty(
@@ -320,9 +402,6 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
             dtype=q.dtype,
             device=q.device,
         )
-        seq_len = (topk_indices != -1).sum(dim=-1)
-        torch.cumsum(seq_len, dim=0, out=attn_metadata.paged_kv_indptr[1:])
-        attn_metadata.paged_kv_indptr_rest.fill_(attn_metadata.paged_kv_indptr[-1])
         fetch_id_to_ragged_triton(
             topk_indices,
             attn_metadata.paged_kv_indptr,
@@ -340,6 +419,8 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
             attn_metadata.paged_kv_indptr,
             attn_metadata.paged_kv_indices,
             attn_metadata.paged_kv_last_page_len,
+            q_scale=layer._q_scale,
+            kv_scale=layer._k_scale,
         )
 
         return output[:, : self.num_heads, :]
@@ -373,7 +454,7 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
         )
 
         attn_out = self._forward_bf16_kv(
-            q, kv_c_and_k_pe_cache, topk_indices_global, attn_metadata
+            q, kv_c_and_k_pe_cache, topk_indices_global, attn_metadata, layer
         )
 
         return attn_out, None

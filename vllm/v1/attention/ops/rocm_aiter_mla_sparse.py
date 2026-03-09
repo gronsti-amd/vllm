@@ -109,7 +109,7 @@ def indexer_k_quant_and_cache_triton(
         block_size,
         num_tokens,
         head_dim,
-        "NHD",
+        "SHUFFLE",
         block_tile_size,
         head_tile_size,
         IS_FNUZ=current_platform.fp8_dtype() == torch.float8_e4m3fnuz,
@@ -210,7 +210,7 @@ def cp_gather_indexer_k_quant_cache_triton(
         block_table_stride,
         k_cache_value.stride(0),
         k_cache_scale.stride(0),
-        "NHD",
+        "SHUFFLE",
         head_dim,
         block_tile_size,
         head_tile_size,
@@ -305,53 +305,33 @@ def rocm_fp8_paged_mqa_logits(
     """
     from vllm._aiter_ops import rocm_aiter_ops
 
-    @functools.lru_cache
-    def paged_mqa_logits_module():
-        paged_mqa_logits_module_path = None
-        if importlib.util.find_spec("aiter.ops.triton.pa_mqa_logits") is not None:
-            paged_mqa_logits_module_path = "aiter.ops.triton.pa_mqa_logits"
-        elif (
-            importlib.util.find_spec("aiter.ops.triton.attention.pa_mqa_logits")
-            is not None
-        ):
-            paged_mqa_logits_module_path = "aiter.ops.triton.attention.pa_mqa_logits"
-
-        if paged_mqa_logits_module_path is not None:
-            try:
-                module = importlib.import_module(paged_mqa_logits_module_path)
-                return module
-            except ImportError:
-                return None
-        return None
-
-    aiter_paged_mqa_logits_module = None
     if rocm_aiter_ops.is_enabled():
-        aiter_paged_mqa_logits_module = paged_mqa_logits_module()
-    # FIXME(ganyi): Temporarily disable the aiter path until nightly docker
-    # update aiter to the fix PR.
-    aiter_paged_mqa_logits_module = None
-
-    if aiter_paged_mqa_logits_module is not None:
-        deepgemm_fp8_paged_mqa_logits_stage1 = (
-            aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits_stage1
+        from aiter.ops.triton.attention.pa_mqa_logits import (
+            deepgemm_fp8_paged_mqa_logits,
         )
+
         batch_size, next_n, heads, _ = q_fp8.shape
-        out_qk = torch.full(
-            (heads, batch_size * next_n, max_model_len),
+        _, block_size, _, _ = kv_cache_fp8.shape
+        out_logits = torch.full(
+            [batch_size * next_n, max_model_len],
             float("-inf"),
             device="cuda",
             dtype=torch.float32,
         )
-        deepgemm_fp8_paged_mqa_logits_stage1(
+        deepgemm_fp8_paged_mqa_logits(
             q_fp8,
             kv_cache_fp8,
             weights,
-            out_qk,
+            out_logits,
             context_lens,
             block_tables,
             max_model_len,
+            ChunkK=256,
+            Preshuffle=block_size == 64,
+            KVBlockSize=block_size,
+            WavePerEU=2,
         )
-        return out_qk.sum(dim=0)
+        return out_logits
     else:
         return fp8_paged_mqa_logits_torch(
             q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
