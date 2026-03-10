@@ -342,12 +342,10 @@ def test_aiter_fa_requires_gfx9(mock_vllm_config):
 
 
 def test_sparse_not_supported(mock_vllm_config):
-    """Test that sparse attention is not supported on ROCm."""
+    """Test that sparse attention rejects unsupported block sizes on ROCm."""
     from vllm.platforms.rocm import RocmPlatform
 
-    with pytest.raises(
-        AssertionError, match="Sparse MLA backend on ROCm only supports block size 1"
-    ):
+    with pytest.raises(ValueError, match="No valid attention backend found"):
         attn_selector_config = AttentionSelectorConfig(
             head_size=128,
             dtype=torch.float16,
