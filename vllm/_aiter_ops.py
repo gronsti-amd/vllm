@@ -1985,6 +1985,8 @@ class rocm_aiter_ops:
         V_QScale_asm: torch.Tensor,
         out_: torch.Tensor,
         kv_cache_dtype: str,
+        max_qlen: int = 1,
+        qo_indptr: torch.Tensor | None = None,
     ):
         """
         Paged attention common function.
@@ -2009,11 +2011,13 @@ class rocm_aiter_ops:
             context_lens=context_lens,
             block_tables_stride0=block_tables_stride0,
             scale=scale,
+            max_qlen=max_qlen,
             K_QScale_hip=K_QScale_hip,
             V_QScale_hip=V_QScale_hip,
             K_QScale_asm=K_QScale_asm,
             V_QScale_asm=V_QScale_asm,
             out_=out_,
+            qo_indptr=qo_indptr,
             kv_cache_dtype=kv_cache_dtype,
         )
 

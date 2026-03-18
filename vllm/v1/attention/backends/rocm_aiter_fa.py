@@ -33,6 +33,8 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
+# paged_attention_v1 (ll4mi) requires HEAD_SIZE >= 16 * NWARPS (= 64).
+_MIN_HEAD_SIZE_FOR_PA_V1 = 64
 if current_platform.is_rocm():
     from vllm.triton_utils import tl, triton
 
@@ -817,6 +819,13 @@ class AiterFlashAttentionImpl(AttentionImpl):
         if sliding_window is None:
             self.sliding_window = (-1, -1)
         else:
+            if rocm_aiter_ops.is_shuffle_kv_cache_enabled():
+                raise ValueError(
+                    "Shuffle KV cache layout is not supported with "
+                    "sliding window attention. Disable "
+                    "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT or use a model "
+                    "without sliding window."
+                )
             self.sliding_window = (sliding_window - 1, 0)
         self.kv_cache_dtype = kv_cache_dtype
         if logits_soft_cap is None:
@@ -1151,92 +1160,109 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 assert attn_metadata.decode_metadata is not None
                 decode_max_query_len = attn_metadata.decode_metadata.max_query_len
 
-                # Use unified_attention for speculative decoding (multi-token)
-                if decode_max_query_len > 1:
-                    assert not rocm_aiter_ops.is_shuffle_kv_cache_enabled(), (
-                        "Shuffle KV cache layout is not supported with "
-                        "speculative decoding (multi-token decode)."
-                    )
-                    from aiter.ops.triton.unified_attention import (
-                        unified_attention,
-                    )
+                if (
+                    not rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+                    or self.sliding_window[0] != -1
+                ):
+                    # Path for non-shuffle or sliding window
+                    # unified_attention handles multi-token spec decode
+                    # and small head sizes that paged_attention_v1
+                    # (ll4mi) cannot support.
+                    if (
+                        decode_max_query_len > 1
+                        or self.head_size < _MIN_HEAD_SIZE_FOR_PA_V1
+                    ):
+                        from aiter.ops.triton.unified_attention import (
+                            unified_attention,
+                        )
 
-                    descale_shape = (
-                        attn_metadata.query_start_loc[:num_decodes].shape[0] - 1,
-                        key_cache.shape[2],
-                    )
-                    unified_attention(
-                        q=query[:num_decode_tokens],
-                        k=key_cache,
-                        v=value_cache,
-                        out=output[:num_decode_tokens],
-                        cu_seqlens_q=attn_metadata.query_start_loc[:num_decodes],
-                        max_seqlen_q=decode_max_query_len,
-                        seqused_k=attn_metadata.seq_lens[:num_decodes],
-                        max_seqlen_k=attn_metadata.max_seq_len,
-                        softmax_scale=self.scale,
-                        causal=True,
-                        alibi_slopes=self.alibi_slopes,
-                        window_size=self.sliding_window,
-                        block_table=attn_metadata.block_table[:num_decodes],
-                        softcap=self.logits_soft_cap,
-                        q_descale=None,
-                        k_descale=layer._k_scale.expand(descale_shape),
-                        v_descale=layer._v_scale.expand(descale_shape),
-                    )
-                    return
+                        descale_shape = (
+                            num_decodes,
+                            key_cache.shape[2],
+                        )
+                        unified_attention(
+                            q=query[:num_decode_tokens],
+                            k=key_cache,
+                            v=value_cache,
+                            out=output[:num_decode_tokens],
+                            cu_seqlens_q=attn_metadata.query_start_loc[
+                                : num_decodes + 1
+                            ],
+                            max_seqlen_q=decode_max_query_len,
+                            seqused_k=attn_metadata.seq_lens[:num_decodes],
+                            max_seqlen_k=attn_metadata.max_seq_len,
+                            softmax_scale=self.scale,
+                            causal=True,
+                            alibi_slopes=self.alibi_slopes,
+                            window_size=self.sliding_window,
+                            block_table=attn_metadata.block_table[:num_decodes],
+                            softcap=self.logits_soft_cap,
+                            q_descale=None,
+                            k_descale=layer._k_scale.expand(descale_shape),
+                            v_descale=layer._v_scale.expand(descale_shape),
+                        )
+                    else:
+                        # paged_attention_v1 (ll4mi) for single-token
+                        # decode with head_size >= 64 on non-shuffle
+                        # layout.
+                        _, num_heads, head_size = query.shape
+                        nbytes_per_qo_elem = torch.finfo(query.dtype).bits // 8
+                        num_seqs = attn_metadata.seq_lens.shape[0]
+                        max_num_partitions = (
+                            attn_metadata.max_seq_len + _PARTITION_SIZE_ROCM - 1
+                        ) // _PARTITION_SIZE_ROCM
 
-                # The ll4mi kernel in paged_attention_v1 requires
-                # HEAD_SIZE >= 16 * NWARPS (= 64 on ROCm with NWARPS=4).
-                # For smaller head sizes or sliding window attention,
-                # fall back to the unified_attention triton kernel which
-                # handles both correctly.
-                _MIN_HEAD_SIZE_FOR_LL4MI = 64
-                use_unified_attention = self.head_size < _MIN_HEAD_SIZE_FOR_LL4MI
+                        workspace_buffer = torch.empty(
+                            (num_seqs * num_heads * max_num_partitions * head_size)
+                            * nbytes_per_qo_elem
+                            + 2 * (num_seqs * num_heads * max_num_partitions) * 4,
+                            dtype=torch.uint8,
+                            device=output.device,
+                        )
 
-                if use_unified_attention:
-                    assert not rocm_aiter_ops.is_shuffle_kv_cache_enabled(), (
-                        "unified_attention fallback with shuffle layout "
-                        "is not supported yet."
-                    )
-                    from aiter.ops.triton.unified_attention import (
-                        unified_attention,
-                    )
+                        import aiter  # noqa: F401
 
-                    decode_cu_seqlens_q = attn_metadata.query_start_loc[
-                        : num_decodes + 1
-                    ]
-                    descale_shape = (
-                        num_decodes,
-                        key_cache.shape[2],
-                    )
-                    unified_attention(
-                        q=query[:num_decode_tokens],
-                        k=key_cache,
-                        v=value_cache,
-                        out=output[:num_decode_tokens],
-                        cu_seqlens_q=decode_cu_seqlens_q,
-                        max_seqlen_q=1,
-                        seqused_k=attn_metadata.seq_lens[:num_decodes],
-                        max_seqlen_k=attn_metadata.max_seq_len,
-                        softmax_scale=self.scale,
-                        causal=True,
-                        alibi_slopes=self.alibi_slopes,
-                        window_size=self.sliding_window,
-                        block_table=attn_metadata.block_table[:num_decodes],
-                        softcap=self.logits_soft_cap,
-                        q_descale=None,
-                        k_descale=layer._k_scale.expand(descale_shape),
-                        v_descale=layer._v_scale.expand(descale_shape),
-                    )
-                elif rocm_aiter_ops.is_shuffle_kv_cache_enabled():
+                        torch.ops.aiter.paged_attention_v1(
+                            output[:num_decode_tokens],
+                            workspace_buffer,
+                            query[:num_decode_tokens],
+                            key_cache,
+                            value_cache,
+                            self.scale,
+                            attn_metadata.block_table[:num_decodes],
+                            attn_metadata.query_start_loc[:num_decodes],
+                            attn_metadata.seq_lens[:num_decodes],
+                            attn_metadata.max_seq_len,
+                            self.alibi_slopes,
+                            self.kv_cache_dtype,
+                            "NHD",
+                            self.logits_soft_cap,
+                            layer._k_scale,
+                            layer._v_scale,
+                            None,
+                            _PARTITION_SIZE_ROCM,
+                            1,
+                            self.sliding_window[0] + 1,
+                        )
+                else:
+                    # Shuffle layout path (sliding window is excluded
+                    # by __init__ validation). paged_attention_common
+                    # lets AITER choose between pa_fwd_asm and
+                    # paged_attention_rocm. Supports multi-token decode
+                    # via max_qlen/qo_indptr when pa_fwd_asm is
+                    # selected.
                     _, num_heads, head_size = query.shape
                     num_seqs = attn_metadata.seq_lens.shape[0]
                     max_num_partitions = (
                         attn_metadata.max_seq_len + _PARTITION_SIZE_ROCM - 1
                     ) // _PARTITION_SIZE_ROCM
                     tmp_out = torch.empty(
-                        (num_seqs, num_heads, max_num_partitions, head_size),
+                        (
+                            num_seqs,
+                            num_heads,
+                            max_num_partitions,
+                            head_size,
+                        ),
                         dtype=query.dtype,
                         device=query.device,
                     )
@@ -1249,12 +1275,24 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     num_blocks, block_size, num_kv_heads, _ = key_cache.shape
                     x = 16 // key_cache.element_size()
                     k_cache_template = torch.empty(
-                        [num_blocks, num_kv_heads, head_size // x, block_size, x],
+                        [
+                            num_blocks,
+                            num_kv_heads,
+                            head_size // x,
+                            block_size,
+                            x,
+                        ],
                         dtype=key_cache.dtype,
                         device="meta",
                     )
                     v_cache_template = torch.empty(
-                        [num_blocks, num_kv_heads, block_size // x, head_size, x],
+                        [
+                            num_blocks,
+                            num_kv_heads,
+                            block_size // x,
+                            head_size,
+                            x,
+                        ],
                         dtype=value_cache.dtype,
                         device="meta",
                     )
@@ -1290,48 +1328,12 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         V_QScale_asm=v_qscale_asm,
                         out_=output[:num_decode_tokens],
                         kv_cache_dtype=self.kv_cache_dtype,
-                    )
-                else:
-                    _, num_heads, head_size = query.shape
-                    nbytes_per_qo_elem = torch.finfo(query.dtype).bits // 8
-                    num_seqs = attn_metadata.seq_lens.shape[0]
-                    max_num_partitions = (
-                        attn_metadata.max_seq_len + _PARTITION_SIZE_ROCM - 1
-                    ) // _PARTITION_SIZE_ROCM
-
-                    workspace_buffer = torch.empty(
-                        (num_seqs * num_heads * max_num_partitions * head_size)
-                        * nbytes_per_qo_elem
-                        + 2 * (num_seqs * num_heads * max_num_partitions) * 4,
-                        dtype=torch.uint8,
-                        device=output.device,
-                    )
-
-                    # import so that aiter register the op to the namespace of
-                    # torch.ops.aiter
-                    import aiter  # noqa: F401
-
-                    torch.ops.aiter.paged_attention_v1(
-                        output[:num_decode_tokens],
-                        workspace_buffer,
-                        query[:num_decode_tokens],
-                        key_cache,
-                        value_cache,
-                        self.scale,
-                        attn_metadata.block_table[:num_decodes],
-                        attn_metadata.query_start_loc[:num_decodes],
-                        attn_metadata.seq_lens[:num_decodes],
-                        attn_metadata.max_seq_len,
-                        self.alibi_slopes,
-                        self.kv_cache_dtype,
-                        "NHD",
-                        self.logits_soft_cap,
-                        layer._k_scale,
-                        layer._v_scale,
-                        None,
-                        _PARTITION_SIZE_ROCM,
-                        1,
-                        self.sliding_window[0] + 1,
+                        max_qlen=decode_max_query_len,
+                        qo_indptr=(
+                            attn_metadata.query_start_loc[: num_decodes + 1]
+                            if decode_max_query_len > 1
+                            else None
+                        ),
                     )
         else:
             raise NotImplementedError(
