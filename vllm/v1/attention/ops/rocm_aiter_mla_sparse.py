@@ -331,29 +331,36 @@ def rocm_fp8_paged_mqa_logits(
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()
 
     if aiter_paged_mqa_logits_module is not None:
-        deepgemm_fp8_paged_mqa_logits_stage1 = (
-            aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits_stage1
+        _deepgemm_fp8_paged_mqa_logits = getattr(
+            aiter_paged_mqa_logits_module,
+            "deepgemm_fp8_paged_mqa_logits",
+            None,
         )
-        batch_size, next_n, heads, _ = q_fp8.shape
-        actual_batch = batch_size * next_n
-        (out_qk,) = current_workspace_manager().get_simultaneous(
-            ((heads, actual_batch, max_model_len), torch.float32),
-        )
-        out_qk.fill_(float("-inf"))
-        deepgemm_fp8_paged_mqa_logits_stage1(
-            q_fp8,
-            kv_cache_fp8,
-            weights,
-            out_qk,
-            context_lens,
-            block_tables,
-            max_model_len,
-        )
-        return out_qk.sum(dim=0)
-    else:
-        return fp8_paged_mqa_logits_torch(
-            q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
-        )
+        if _deepgemm_fp8_paged_mqa_logits is not None:
+            batch_size, next_n, heads, _ = q_fp8.shape
+            actual_batch = batch_size * next_n
+            (out_logits,) = current_workspace_manager().get_simultaneous(
+                ((actual_batch, max_model_len), torch.float32),
+            )
+            out_logits.fill_(float("-inf"))
+            _deepgemm_fp8_paged_mqa_logits(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                out_logits,
+                context_lens,
+                block_tables,
+                max_model_len,
+                KVBlockSize=1,
+                Preshuffle=False,
+                ChunkK=256,
+                WavePerEU=2,
+            )
+            return out_logits
+
+    return fp8_paged_mqa_logits_torch(
+        q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
+    )
 
 
 # Take from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L84
@@ -514,11 +521,10 @@ def rocm_aiter_sparse_attn_indexer(
             ((total_seq_lens, 4), torch.uint8),
         )
 
-        # Decode out_qk buffer, used by rocm_fp8_paged_mqa_logits.
+        # Decode out_logits buffer, used by rocm_fp8_paged_mqa_logits.
         # actual_batch <= hidden_states.shape[0] == max_num_batched_tokens
-        heads = q_fp8.shape[1]
         workspace_manager.get_simultaneous(
-            ((heads, hidden_states.shape[0], max_model_len), torch.float32),
+            ((hidden_states.shape[0], max_model_len), torch.float32),
         )
 
         # Transient logits tensor peak memory, produced by
