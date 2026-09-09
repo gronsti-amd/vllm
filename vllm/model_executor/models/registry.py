@@ -638,10 +638,7 @@ _SPECULATIVE_DECODING_MODELS = {
     "DSparkDraftModel": ("vllm.models.deepseek_v4", "DSparkDeepseekV4ForCausalLM"),
     "Qwen3DSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
     "Qwen3OmniDSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
-    "K3DSparkModel": (
-        "vllm.models.kimi_k3.nvidia.dspark_mla",
-        "K3DSparkForCausalLM",
-    ),
+    "K3DSparkModel": ("vllm.models.kimi_k3", "K3DSparkForCausalLM"),
     "DFlashLagunaForCausalLM": ("laguna_dflash", "DFlashLagunaForCausalLM"),
     "Gemma4DSparkModel": ("gemma4_dspark", "Gemma4DSparkForCausalLM"),
     "PEagleDraftModel": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
