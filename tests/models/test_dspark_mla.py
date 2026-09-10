@@ -193,3 +193,73 @@ def test_context_kv_weights_are_loaded_as_merged_linear_shards():
     assert [weight.shard_id for _, weight in mapped] == [1, 0, 1, 1]
     assert mapped[0][1].data_ptr() == mapped[1][1].data_ptr()
     assert mapped[2][1].data_ptr() == mapped[3][1].data_ptr()
+
+
+@pytest.mark.skipif(
+    not current_platform.is_rocm(),
+    reason="Kimi-K3 DSpark MLA wrapper is the ROCm draft path",
+)
+def test_k3_dspark_decoder_uses_mla_wrapper(monkeypatch: pytest.MonkeyPatch):
+    captured: dict = {}
+
+    class DummyLinear(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.reduce_results = True
+
+    class DummyRope(nn.Module):
+        pass
+
+    class DummyWrapper(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            self.o_proj = DummyLinear()
+            self.rotary_emb = DummyRope()
+            self.mla_attn = SimpleNamespace(
+                layer_name=f"{args[11]}.attn",
+                non_causal_multi_token_decode=kwargs["non_causal_multi_token_decode"],
+            )
+
+    monkeypatch.setattr(dspark_mla, "get_draft_quant_config", lambda _: None)
+    monkeypatch.setattr(dspark_mla, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(dspark_mla, "MergedColumnParallelLinear", DummyLinear)
+    monkeypatch.setattr(dspark_mla, "ColumnParallelLinear", DummyLinear)
+    monkeypatch.setattr(dspark_mla, "RowParallelLinear", DummyLinear)
+    monkeypatch.setattr(dspark_mla, "RMSNorm", DummyLinear)
+    monkeypatch.setattr(dspark_mla, "KimiMLP", DummyLinear)
+    monkeypatch.setattr(dspark_mla, "get_rope", lambda *args, **kwargs: DummyRope())
+    monkeypatch.setattr(
+        dspark_mla, "KimiK3MultiHeadLatentAttentionWrapper", DummyWrapper
+    )
+
+    config = SimpleNamespace(
+        hidden_size=8,
+        num_attention_heads=2,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=2,
+        v_head_dim=4,
+        q_lora_rank=16,
+        kv_lora_rank=8,
+        rms_norm_eps=1e-6,
+        intermediate_size=16,
+        hidden_act="silu",
+        max_position_embeddings=128,
+        rope_parameters={"rope_type": "default"},
+    )
+    vllm_config = SimpleNamespace(cache_config=None)
+    layer = dspark_mla.K3DSparkDecoderLayer(
+        vllm_config=vllm_config,
+        config=config,
+        layer_idx=0,
+        start_layer_id=61,
+        prefix="model",
+    )
+
+    assert isinstance(layer.self_attn, DummyWrapper)
+    assert layer.self_attn.o_proj.reduce_results is False
+    assert captured["kwargs"]["non_causal_multi_token_decode"] is True
+    assert captured["args"][11] == "model.layers.61.self_attn"
+    assert captured["args"][8].rotary_emb is not None
+    assert layer.self_attn.mla_attn.layer_name == "model.layers.61.self_attn.attn"
