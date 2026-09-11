@@ -2,13 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """AMD-specific MLA wrapper for Kimi-K3."""
 
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.mla import MultiHeadLatentAttentionWrapper
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 
 
 class KimiK3MultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
@@ -17,6 +20,9 @@ class KimiK3MultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._use_eager_qk_rmsnorm_fusion = bool(rocm_aiter_ops.is_enabled())
+        if self.rotary_emb is not None and self.mla_attn.non_causal_multi_token_decode:
+            # DSpark: MLAAttention reads this after absorb BMM for fused RoPE+cache.
+            self.mla_attn.rotary_emb = cast("RotaryEmbedding", self.rotary_emb)
 
     def _normalize_q_kv(
         self,
@@ -91,7 +97,8 @@ class KimiK3MultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             heads *= q_proj_layer.group_size
         q = q.view(-1, heads, self.qk_head_dim)
 
-        if self.rotary_emb is not None:
+        fuse_qk_rope = self.mla_attn._use_fused_qk_rope_concat()
+        if self.rotary_emb is not None and not fuse_qk_rope:
             q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                 positions, q[..., self.qk_nope_head_dim :], k_pe
             )
@@ -112,6 +119,7 @@ class KimiK3MultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             k_pe,
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
             q_dcp_replicated=q_dcp_replicated,
+            positions=positions if fuse_qk_rope else None,
         )
 
         if self.g_proj is not None:
