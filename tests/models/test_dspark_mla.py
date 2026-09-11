@@ -263,3 +263,29 @@ def test_k3_dspark_decoder_uses_mla_wrapper(monkeypatch: pytest.MonkeyPatch):
     assert captured["args"][11] == "model.layers.61.self_attn"
     assert captured["args"][8].rotary_emb is not None
     assert layer.self_attn.mla_attn.layer_name == "model.layers.61.self_attn.attn"
+
+
+def test_fused_qk_rope_concat_requires_fp32_cos_sin():
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    if not bool(rocm_aiter_ops.is_fused_qk_rope_concat_and_cache_mla_enabled()):
+        pytest.skip("AITER fused_qk_rope_concat_and_cache_mla is not available")
+
+    dummy = torch.zeros(1, 1, 8)
+    bf16_table = torch.zeros(4, 32, dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="fp32"):
+        rocm_aiter_ops.fused_qk_rope_concat_and_cache_mla(
+            dummy,
+            dummy,
+            dummy.view(1, 8),
+            dummy.view(1, 8),
+            dummy,
+            dummy,
+            torch.zeros(1, dtype=torch.int64),
+            torch.ones(1),
+            torch.ones(1),
+            torch.zeros(1, dtype=torch.int64),
+            bf16_table,
+            bf16_table,
+            is_neox=False,
+        )

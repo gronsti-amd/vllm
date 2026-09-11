@@ -4,7 +4,9 @@
 
 The draft decoder uses ``KimiK3MultiHeadLatentAttentionWrapper`` so absorb
 BMM goes through generic ``MLAAttention`` (AITER FP4/FP8 when those flags are
-on). Context-KV insert stays on grouped ``concat_and_cache_mla_grouped``.
+on). Decode fuses Q/K RoPE with MLA cache insert via
+``fused_qk_rope_concat_and_cache_mla``. Context-KV insert stays on grouped
+``concat_and_cache_mla_grouped``.
 Do not reuse ``KimiMLAAttention``: that class is NoPE-only i.e. has no RoPE.
 """
 

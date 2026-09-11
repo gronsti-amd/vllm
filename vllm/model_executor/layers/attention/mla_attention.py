@@ -207,7 +207,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
 from math import lcm
-from typing import ClassVar, Generic, TypeVar, cast
+from typing import TYPE_CHECKING, ClassVar, Generic, TypeVar, cast
 
 import numpy as np
 import torch
@@ -308,6 +308,9 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     get_kv_quant_mode,
 )
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 
 logger = init_logger(__name__)
 
@@ -453,6 +456,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.layer_name = prefix
         self.indexer = indexer
         self.non_causal_multi_token_decode = non_causal_multi_token_decode
+        self.rotary_emb: "RotaryEmbedding | None" = None
+        self._decode_positions: torch.Tensor | None = None
         self.sliding_window = sliding_window
         self.num_kv_heads = 1
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -724,6 +729,93 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
         return self._chunked_prefill_workspace_size
 
+    def _use_fused_qk_rope_concat(self) -> bool:
+        """DSpark decode: AITER fused QK RoPE + cache insert after absorb BMM."""
+        return (
+            self.non_causal_multi_token_decode
+            and self.rotary_emb is not None
+            and bool(rocm_aiter_ops.is_fused_qk_rope_concat_and_cache_mla_enabled())
+        )
+
+    def _fused_decode_qk_rope_concat(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> torch.Tensor:
+        """QK RoPE + concat absorbed Q + MLA cache write. ``q_out`` keeps the dtype of query."""
+        rotary_emb = self.rotary_emb
+        assert rotary_emb is not None
+        cos_cache, sin_cache = rotary_emb.cos_sin_cache.chunk(2, dim=-1)
+        if k_pe.dim() == 3:
+            k_pe = k_pe.squeeze(1)
+        num_tokens, num_heads, kv_lora_rank = q_nope.shape
+        q_out = torch.empty(
+            (num_tokens, num_heads, kv_lora_rank + q_pe.shape[-1]),
+            dtype=q_nope.dtype,
+            device=q_nope.device,
+        )
+        if kv_cache.numel() == 0:
+            return q_out
+        kv_view = kv_cache.view(
+            kv_cache.shape[0],
+            -1,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+        )
+        rocm_aiter_ops.fused_qk_rope_concat_and_cache_mla(
+            q_nope,
+            q_pe,
+            kv_c_normed,
+            k_pe,
+            kv_view,
+            q_out,
+            slot_mapping.flatten(),
+            self._k_scale,
+            self._q_scale,
+            positions,
+            cos_cache,
+            sin_cache,
+            is_neox=rotary_emb.is_neox_style,
+            is_nope_first=True,
+            compute_all_q_rope=self.impl.dcp_world_size > 1,
+        )
+        return q_out
+
+    def _update_prefill_kv_cache_for_fused_decode(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+        num_decode_tokens: int,
+    ) -> None:
+        """Write only prefill slots; decode slots are filled by the fused kernel."""
+        num_tokens = kv_c_normed.shape[0]
+        if num_decode_tokens >= num_tokens:
+            return
+        k_pe_pf = k_pe[num_decode_tokens:]
+        positions = self._decode_positions
+        rotary_emb = self.rotary_emb
+        if rotary_emb is not None and positions is not None:
+            pos_pf = positions[num_decode_tokens:num_tokens]
+            rotary_emb(pos_pf, k_pe_pf, None)
+        self.impl.do_kv_cache_update(
+            kv_c_normed[num_decode_tokens:],
+            k_pe_pf,
+            kv_cache,
+            slot_mapping[num_decode_tokens:]
+            if slot_mapping.dim() > 0
+            else slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+        )
+
     def forward(
         self,
         q: torch.Tensor,
@@ -731,7 +823,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_pe: torch.Tensor,
         output_shape: torch.Size | None = None,
         q_dcp_replicated: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        self._decode_positions = positions
         if self.use_direct_call:
             forward_context: ForwardContext = get_forward_context()
             attn_metadata_raw = forward_context.attn_metadata
@@ -762,14 +856,32 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     self.use_pcp,
                 )
             )
-            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-                kv_for_cache,
-                kpe_for_cache,
-                self_kv_cache,
-                layer_slot_mapping,
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
+            if (
+                self._use_fused_qk_rope_concat()
+                and self._decode_positions is not None
+                and layer_slot_mapping is not None
+            ):
+                num_decode = (
+                    attn_metadata.num_decode_tokens if attn_metadata is not None else 0
+                )
+                self._update_prefill_kv_cache_for_fused_decode(
+                    kv_for_cache,
+                    kpe_for_cache,
+                    self_kv_cache,
+                    layer_slot_mapping,
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                    num_decode or 0,
+                )
+            else:
+                self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                    kv_for_cache,
+                    kpe_for_cache,
+                    self_kv_cache,
+                    layer_slot_mapping,
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             self.forward_impl(
                 q,
@@ -920,10 +1032,23 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mha_output = output
                 mha_output_scale = None
 
+            q_mha = q[num_mqa_tokens:]
+            k_pe_mha = k_pe[num_mqa_tokens:]
+            if (
+                self._use_fused_qk_rope_concat()
+                and self.rotary_emb is not None
+                and self._decode_positions is not None
+            ):
+                q_mha = q_mha.clone()
+                pos_mha = self._decode_positions[num_mqa_tokens:num_actual_toks]
+                q_mha[..., self.qk_nope_head_dim :], _ = self.rotary_emb(
+                    pos_mha, q_mha[..., self.qk_nope_head_dim :], None
+                )
+
             self.impl.forward_mha(  # type: ignore[attr-defined]
-                q[num_mqa_tokens:],
+                q_mha,
                 k_c_normed[num_mqa_tokens:],
-                k_pe[num_mqa_tokens:],
+                k_pe_mha,
                 kv_cache,
                 attn_metadata,
                 self._k_scale,
@@ -1007,7 +1132,23 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-            if fp8_attention and self.impl.supports_quant_query_input:
+            if self._use_fused_qk_rope_concat() and self._decode_positions is not None:
+                forward_context = get_forward_context()
+                slot_mapping = forward_context.slot_mapping
+                assert isinstance(slot_mapping, dict)
+                layer_slot_mapping = slot_mapping.get(self.layer_name)
+                assert layer_slot_mapping is not None
+                decode_slots = layer_slot_mapping[:num_mqa_tokens]
+                mqa_q = self._fused_decode_qk_rope_concat(
+                    mqa_ql_nope,
+                    mqa_q_pe,
+                    k_c_normed[:num_mqa_tokens],
+                    k_pe[:num_mqa_tokens],
+                    kv_cache,
+                    self._decode_positions[:num_mqa_tokens],
+                    decode_slots,
+                )
+            elif fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
                 mqa_q = self._decode_concat_quant_fp8_op(
@@ -1355,14 +1496,31 @@ def unified_mla_kv_cache_update(
             attn_metadata.num_decode_tokens if attn_metadata is not None else None,
             attn_layer.use_pcp,
         )
-        attn_layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-            kv_c_normed,
-            k_pe,
-            kv_cache,
-            layer_slot_mapping,
-            kv_cache_dtype,
-            k_scale,
-        )
+        if (
+            attn_layer._use_fused_qk_rope_concat()
+            and attn_layer._decode_positions is not None
+        ):
+            num_decode = (
+                attn_metadata.num_decode_tokens if attn_metadata is not None else 0
+            )
+            attn_layer._update_prefill_kv_cache_for_fused_decode(
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                layer_slot_mapping,
+                kv_cache_dtype,
+                k_scale,
+                num_decode or 0,
+            )
+        else:
+            attn_layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                layer_slot_mapping,
+                kv_cache_dtype,
+                k_scale,
+            )
 
     return torch.empty(0, device=kv_c_normed.device, dtype=kv_c_normed.dtype)
 
